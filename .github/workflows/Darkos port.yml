@@ -1,12 +1,12 @@
-name: Port DarkOS4clones for M9 Pro
+name: Auto-Build DarkOS4Clone for M9 Pro
 
 on:
   workflow_dispatch:
     inputs:
-      base_image_url:
-        description: 'URL zum DarkOS / ArkOS Clone Base-Image (.img.xz / .7z / .zip)'
+      custom_image_url:
+        description: 'Optional: Manuelle Image-URL (leer lassen für automatisches Release von lcdyk0517/arkos4clone)'
         required: false
-        default: 'https://github.com/ChristianHaitian/arkos/releases/download/v2.0.01242024/ArkOS_R36S_v2.0_01242024.img.xz'
+        default: ''
 
 permissions:
   contents: write
@@ -19,103 +19,127 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install Build Tools & Loop Utilities
+      - name: Install Tools (DTC, Loop Tools, Compression)
         run: |
           sudo apt-get update
-          sudo apt-get install -y device-tree-compiler kpartx p7zip-full mtools e2tools curl wget python3
+          sudo apt-get install -y device-tree-compiler kpartx p7zip-full mtools e2tools curl wget jq
 
       - name: Compile M9 Pro DTS to DTB
         run: |
-          echo "=== 1. Hardware-Definition verarbeiten ==="
+          echo "=== 1. Kompiliere Hardware-Definition (DTB) ==="
           if [ -f "rg32tw3ka.dts" ]; then
-            echo "Kompiliere rg32tw3ka.dts zu m9pro.dtb..."
+            echo "Kompiliere rg32tw3ka.dts..."
             dtc -I dts -O dtb -o m9pro.dtb rg32tw3ka.dts
           elif [ -f "rg32tw3ka.dtb" ]; then
-            echo "Verwende vorhandene rg32tw3ka.dtb..."
+            echo "Nutze rg32tw3ka.dtb..."
             cp rg32tw3ka.dtb m9pro.dtb
           else
-            echo "::error::Weder rg32tw3ka.dts noch rg32tw3ka.dtb im Repo gefunden!"
+            echo "::error::Keine rg32tw3ka.dts oder rg32tw3ka.dtb im Repo-Hauptverzeichnis gefunden!"
             exit 1
           fi
 
-      - name: Download and Extract Base DarkOS Image
+      - name: Fetch Latest Image from lcdyk0517/arkos4clone
         run: |
           mkdir -p build_dir
           cd build_dir
-          
-          IMAGE_URL="${{ github.event.inputs.base_image_url }}"
-          echo "Lade DarkOS Base Image herunter von: $IMAGE_URL"
+
+          CUSTOM_URL="${{ github.event.inputs.custom_image_url }}"
+
+          if [ -n "$CUSTOM_URL" ]; then
+            IMAGE_URL="$CUSTOM_URL"
+            echo "Verwende manuell eingegebene URL: $IMAGE_URL"
+          else
+            echo "Suche automatisch nach dem neuesten Release von lcdyk0517/arkos4clone..."
+            
+            # API Abfrage für das neueste Release aus lcdyk0517/arkos4clone
+            RELEASE_JSON=$(curl -s https://api.github.com/repos/lcdyk0517/arkos4clone/releases/latest)
+            
+            # Suche nach Download-Links für .img.xz, .7z, .zip oder .img.gz
+            IMAGE_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | test(".*\\.(img\\.xz|7z|zip|img\\.gz)$")) | .browser_download_url' | head -n 1)
+
+            # Fallback auf alle Releases, falls 'latest' keine passende Datei enthält
+            if [ -z "$IMAGE_URL" ] || [ "$IMAGE_URL" == "null" ]; then
+              echo "Kein Asset im 'latest' Release gefunden. Suche in allen Releases..."
+              IMAGE_URL=$(curl -s https://api.github.com/repos/lcdyk0517/arkos4clone/releases | jq -r '.[].assets[] | select(.name | test(".*\\.(img\\.xz|7z|zip|img\\.gz)$")) | .browser_download_url' | head -n 1)
+            fi
+
+            # Sicherheits-Fallback falls arkos4clone keine Releases hat
+            if [ -z "$IMAGE_URL" ] || [ "$IMAGE_URL" == "null" ]; then
+              echo "Warnung: Kein direktes Release bei arkos4clone gefunden. Verwende ArkOS Clone Fallback."
+              IMAGE_URL="https://github.com/ChristianHaitian/arkos/releases/download/v2.0.01242024/ArkOS_R36S_v2.0_01242024.img.xz"
+            fi
+          fi
+
+          echo "Lade Base-Image herunter von: $IMAGE_URL"
           wget -q --show-progress -O archive_file "$IMAGE_URL"
 
-          echo "Entpacke Base Image..."
+          echo "Entpacke Base-Image..."
           if [[ "$IMAGE_URL" == *.xz ]]; then
             unxz archive_file -c > darkos_m9pro.img
           elif [[ "$IMAGE_URL" == *.gz ]]; then
             gunzip -c archive_file > darkos_m9pro.img
           elif [[ "$IMAGE_URL" == *.7z ]] || [[ "$IMAGE_URL" == *.zip ]]; then
             7z x archive_file -oext
-            mv ext/*.img darkos_m9pro.img
+            mv ext/*.img darkos_m9pro.img || mv ext/*/*.img darkos_m9pro.img
           else
             mv archive_file darkos_m9pro.img
           fi
 
+          rm -rf archive_file ext
           ls -lh darkos_m9pro.img
 
-      - name: Inject M9 Pro Specs (DTB, Boot-Configs & RK915A WiFi)
+      - name: Mount and Patch Partition (M9 Pro DTB Injection)
         run: |
           cd build_dir
 
-          # Image als Loop-Devices einrichten
+          echo "Binde Image als Loop-Device ein..."
           sudo kpartx -av darkos_m9pro.img
           
-          # Erkenne gemountete Partitionen (p1 = BOOT, p2 = RootFS)
+          # Partitionen ermitteln (p1 = BOOT Partition)
           LOOP_DEV=$(ls /dev/mapper/loop*p1 | head -n 1 | sed 's/p1//')
-          echo "Gemountetes Loop Device: $LOOP_DEV"
+          echo "Loop Device erkannt: $LOOP_DEV"
 
           mkdir -p mnt_boot mnt_rootfs
           sudo mount ${LOOP_DEV}p1 mnt_boot
-          sudo mount ${LOOP_DEV}p2 mnt_rootfs
+          sudo mount ${LOOP_DEV}p2 mnt_rootfs 2>/dev/null || true
 
-          echo "=== 1. Injiziere M9 Pro DTB (Display, LEDs, Buttons) ==="
+          echo "=== Patching BOOT Partition ==="
+          # Kopiere M9 Pro DTB
           sudo cp ../m9pro.dtb mnt_boot/rg32tw3ka.dtb
           
-          # Überschreibe alle Standard-DTB-Fallbacks, falls das OS feste Namen sucht
+          # Überschreibe Standard DTBs im Bootloader
           sudo cp ../m9pro.dtb mnt_boot/rk3326-r36s-linux.dtb 2>/dev/null || true
           sudo cp ../m9pro.dtb mnt_boot/rk3326-rg351p-linux.dtb 2>/dev/null || true
 
-          echo "=== 2. Anpassen der Bootloader-Konfigurationen ==="
-          # boot.ini anpassen
+          # Passe boot.ini an
           if [ -f "mnt_boot/boot.ini" ]; then
             sudo sed -i 's/dtb_name=.*/dtb_name=rg32tw3ka.dtb/' mnt_boot/boot.ini 2>/dev/null || true
             sudo sed -i 's/rk3326-r36s-linux.dtb/rg32tw3ka.dtb/g' mnt_boot/boot.ini 2>/dev/null || true
           fi
 
-          # extlinux.conf anpassen
+          # Passe extlinux.conf an
           if [ -f "mnt_boot/extlinux/extlinux.conf" ]; then
             sudo sed -i 's/rk3326-r36s-linux.dtb/rg32tw3ka.dtb/g' mnt_boot/extlinux/extlinux.conf 2>/dev/null || true
             sudo sed -i 's/fdt .*/fdt \/rg32tw3ka.dtb/g' mnt_boot/extlinux/extlinux.conf 2>/dev/null || true
           fi
 
-          echo "=== 3. RK915A WiFi & System-Vorbereitung ==="
-          # Falls extra Firmware-Dateien im Repo vorliegen (z.B. im Ordner firmware/), kopieren
-          if [ -d "../firmware" ]; then
-            echo "Kopiere Treiber-Firmware aus Repo in /lib/firmware..."
-            sudo cp -r ../firmware/* mnt_rootfs/lib/firmware/ 2>/dev/null || true
-          fi
+          # Synchrone Dateisystem-Anderung erzwingen
+          sync
 
-          # Aufräumen & Aushängen
+          # Aushängen
           sudo umount mnt_boot
-          sudo umount mnt_rootfs
+          sudo umount mnt_rootfs 2>/dev/null || true
           sudo kpartx -d darkos_m9pro.img
 
-      - name: Compress Ported M9 Pro Image
+      - name: Compress Finished M9 Pro Image
         run: |
           cd build_dir
-          echo "Komprimiere fertiges M9 Pro Custom Image..."
-          7z a -t7z -m0=lzma2 -mx=9 DarkOS_M9Pro_Ported.7z darkos_m9pro.img
+          echo "Kompression des fertigen Images..."
+          7z a -t7z -m0=lzma2 -mx=4 DarkOS_M9Pro_Patched.7z darkos_m9pro.img
+          rm -f darkos_m9pro.img
 
-      - name: Upload Image Artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DarkOS_M9Pro_Ported_Image
-          path: build_dir/DarkOS_M9Pro_Ported.7z
+          name: DarkOS_M9Pro_Patched_Image
+          path: build_dir/DarkOS_M9Pro_Patched.7z
