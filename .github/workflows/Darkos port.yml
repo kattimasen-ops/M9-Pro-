@@ -1,12 +1,12 @@
-name: Robust DarkOS4Clone M9 Pro Build
+name: DarkOS4Clone M9 Pro Multi-Part Build
 
 on:
   workflow_dispatch:
     inputs:
-      image_url:
-        description: 'Image Download URL (Standard = ArkOS/DarkOS Clone Base)'
+      release_tag:
+        description: 'Release Tag bei lcdyk0517/arkos4clone'
         required: false
-        default: 'https://github.com/ChristianHaitian/arkos/releases/download/v2.0.01242024/ArkOS_R36S_v2.0_01242024.img.xz'
+        default: '20260808'
 
 permissions:
   contents: write
@@ -44,71 +44,82 @@ jobs:
           fi
           echo "DTB erfolgreich erstellt: $(du -h m9pro_patched.dtb | cut -f1)"
 
-      - name: Step 2 - Download Base Image
+      - name: Step 2 - Download All Parts from Release Tag
         run: |
-          echo "=== STEP 2: Base Image Download ==="
+          echo "=== STEP 2: Download aller Release-Parts ==="
+          mkdir -p download_parts
+          cd download_parts
+
+          TAG="${{ github.event.inputs.release_tag }}"
+          echo "Lade Assets für Tag '$TAG' aus lcdyk0517/arkos4clone..."
+
+          # Abfrage der Release-Assets via GitHub API für das angegebene Tag
+          RELEASE_JSON=$(curl -s -H "Accept: application/vnd.github+json" "https://api.github.com/repos/lcdyk0517/arkos4clone/releases/tags/$TAG")
+
+          # Falls Tag nicht gefunden wird, Fallback auf latest Release
+          if echo "$RELEASE_JSON" | grep -q "Not Found"; then
+            echo "Tag $TAG nicht gefunden, wähle latest Release..."
+            RELEASE_JSON=$(curl -s -H "Accept: application/vnd.github+json" https://api.github.com/repos/lcdyk0517/arkos4clone/releases/latest)
+          fi
+
+          # Extrahiere alle Download-Links der vorhandenen Archive/Parts
+          URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[]?.browser_download_url')
+
+          if [ -z "$URLS" ] || [ "$URLS" == "null" ]; then
+            echo "::error::Keine Download-Assets im Release $TAG gefunden!"
+            exit 1
+          fi
+
+          echo "Gefundene Parts:"
+          echo "$URLS"
+
+          # Alle Part-Dateien herunterladen
+          for url in $URLS; do
+            echo "Lade Part herunter: $url"
+            wget --continue --progress=dot:giga "$url"
+          done
+
+          echo "Download abgeschlossen. Heruntergeladene Dateien:"
+          ls -lh
+
+      - name: Step 3 - Extract Multi-Part Archive
+        run: |
+          echo "=== STEP 3: Zusammenfügen & Entpacken der Parts ==="
           mkdir -p workdir
-          cd workdir
 
-          URL="${{ github.event.inputs.image_url }}"
-          
-          # Versuch: Prüfe ob lcdyk0517/arkos4clone Releases hat
-          CLONE_URL=$(curl -s -H "Accept: application/vnd.github+json" https://api.github.com/repos/lcdyk0517/arkos4clone/releases/latest | jq -r '.assets[]? | select(.name | test(".*\\.(img\\.xz|7z|zip|img\\.gz)$")) | .browser_download_url' | head -n 1 || true)
+          # Suche nach der ersten Part-Datei (.001, .part1.rar, .zip.001 etc.)
+          FIRST_PART=$(ls download_parts/*.001 download_parts/*.part1.rar download_parts/*.part01.rar 2>/dev/null | head -n 1 || true)
 
-          if [ -n "$CLONE_URL" ] && [ "$CLONE_URL" != "null" ]; then
-            echo "Release in lcdyk0517/arkos4clone gefunden: $CLONE_URL"
-            URL="$CLONE_URL"
-          else
-            echo "Hinweis: Keine Binär-Dateien in lcdyk0517/arkos4clone Releases gefunden. Nutze bewährtes ArkOS/DarkOS Clone Base-Image."
+          # Fallback: Falls es sich um ein einzelnes Archiv handelt
+          if [ -z "$FIRST_PART" ]; then
+            FIRST_PART=$(ls download_parts/*.7z download_parts/*.zip download_parts/*.rar 2>/dev/null | head -n 1 || true)
           fi
 
-          echo "Lade Image herunter von: $URL"
-          wget --continue --progress=dot:giga -O base_archive "$URL"
-
-          if [ ! -s "base_archive" ]; then
-            echo "::error::Download fehlgeschlagen oder Datei ist 0 Bytes groß!"
+          if [ -z "$FIRST_PART" ]; then
+            echo "::error::Keine entpackbare Archiv-Datei in download_parts gefunden!"
             exit 1
           fi
-          echo "Download erfolgreich: $(du -h base_archive | cut -f1)"
 
-      - name: Step 3 - Decompress Image
-        run: |
-          echo "=== STEP 3: Entpacken des Images ==="
-          cd workdir
+          echo "Entpacke Multi-Part Archiv über Haupt-Part: $FIRST_PART"
+          7z x "$FIRST_PART" -oworkdir/ -y
 
-          ARCHIVE_TYPE=$(file base_archive)
-          echo "Archiv-Typ: $ARCHIVE_TYPE"
+          # Suche nach der daraus hervorgehenden .img-Datei
+          IMG_FILE=$(find workdir/ -name "*.img" | head -n 1)
 
-          if [[ "$ARCHIVE_TYPE" == *"XZ compressed"* ]]; then
-            unxz -v -c base_archive > darkos_m9pro.img
-          elif [[ "$ARCHIVE_TYPE" == *"gzip compressed"* ]]; then
-            gunzip -c base_archive > darkos_m9pro.img
-          elif [[ "$ARCHIVE_TYPE" == *"7-zip archive"* ]] || [[ "$ARCHIVE_TYPE" == *"Zip archive"* ]]; then
-            7z x base_archive -oout/
-            IMG_FILE=$(find out/ -name "*.img" | head -n 1)
-            if [ -n "$IMG_FILE" ]; then
-              mv "$IMG_FILE" darkos_m9pro.img
-            else
-              echo "::error::Keine .img Datei im Entpackten Archiv gefunden!"
-              exit 1
-            fi
-          else
-            echo "Keine Kompression erkannt, nutze Datei direkt als .img..."
-            mv base_archive darkos_m9pro.img
-          fi
-
-          if [ ! -s "darkos_m9pro.img" ]; then
-            echo "::error::Entpacktes Image ist leer!"
+          if [ -z "$IMG_FILE" ]; then
+            echo "::error::Keine .img Datei im entpackten Archiv gefunden!"
             exit 1
           fi
-          echo "Image entpackt. Größe: $(du -h darkos_m9pro.img | cut -f1)"
+
+          echo "Gefundenes Image: $IMG_FILE"
+          mv "$IMG_FILE" workdir/darkos_m9pro.img
+          echo "Gesamtgröße des entpackten Images: $(du -h workdir/darkos_m9pro.img | cut -f1)"
 
       - name: Step 4 - Mount & Patch M9 Pro DTB
         run: |
           echo "=== STEP 4: Injiziere M9 Pro DTB in Boot-Partition ==="
           cd workdir
 
-          # Binde Image über Loop-Device ein
           sudo kpartx -av darkos_m9pro.img
           sleep 2
 
@@ -118,42 +129,40 @@ jobs:
             exit 1
           fi
 
-          echo "Boot Partition gefunden unter: $LOOP_BOOT"
+          echo "Boot-Partition gemountet unter: $LOOP_BOOT"
           mkdir -p mnt_boot
           sudo mount "$LOOP_BOOT" mnt_boot
 
           echo "Kopiere M9 Pro DTB..."
           sudo cp ../m9pro_patched.dtb mnt_boot/rg32tw3ka.dtb
-          sudo cp ../m9pro_patched.dtb mnt_boot/rk3326-r36s-linux.dtb
+          sudo cp ../m9pro_patched.dtb mnt_boot/rk3326-r36s-linux.dtb || true
           sudo cp ../m9pro_patched.dtb mnt_boot/rk3326-rg351p-linux.dtb || true
 
           # boot.ini anpassen
           if [ -f "mnt_boot/boot.ini" ]; then
             echo "Passe boot.ini an..."
-            sudo sed -i 's/dtb_name=.*/dtb_name=rg32tw3ka.dtb/' mnt_boot/boot.ini
-            sudo sed -i 's/rk3326-r36s-linux.dtb/rg32tw3ka.dtb/g' mnt_boot/boot.ini
+            sudo sed -i 's/dtb_name=.*/dtb_name=rg32tw3ka.dtb/' mnt_boot/boot.ini || true
+            sudo sed -i 's/rk3326-r36s-linux.dtb/rg32tw3ka.dtb/g' mnt_boot/boot.ini || true
           fi
 
           # extlinux.conf anpassen
           if [ -f "mnt_boot/extlinux/extlinux.conf" ]; then
             echo "Passe extlinux.conf an..."
-            sudo sed -i 's/rk3326-r36s-linux.dtb/rg32tw3ka.dtb/g' mnt_boot/extlinux/extlinux.conf
-            sudo sed -i 's/fdt .*/fdt \/rg32tw3ka.dtb/g' mnt_boot/extlinux/extlinux.conf
+            sudo sed -i 's/rk3326-r36s-linux.dtb/rg32tw3ka.dtb/g' mnt_boot/extlinux/extlinux.conf || true
+            sudo sed -i 's/fdt .*/fdt \/rg32tw3ka.dtb/g' mnt_boot/extlinux/extlinux.conf || true
           fi
 
           sync
           sudo umount mnt_boot
           
-          # Loop Device sauber aushängen
           LOOP_DEV=$(echo "$LOOP_BOOT" | sed -E 's/p1$//; s|^/dev/mapper/||')
           sudo kpartx -d "/dev/$LOOP_DEV" || sudo kpartx -d darkos_m9pro.img || true
           echo "Boot-Partition erfolgreich gepatcht!"
 
       - name: Step 5 - Compress & Package Output
         run: |
-          echo "=== STEP 5: Komprimiere fertiges Image ==="
+          echo "=== STEP 5: Komprimiere fertiges M9 Pro Image ==="
           cd workdir
-          # mx=1 für schnelle Kompression ohne GitHub Timeout
           7z a -t7z -m0=lzma2 -mx=1 DarkOS_M9Pro_Patched.7z darkos_m9pro.img
           echo "Fertiges Archiv: $(du -h DarkOS_M9Pro_Patched.7z | cut -f1)"
 
