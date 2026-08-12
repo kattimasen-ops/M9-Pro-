@@ -1,0 +1,178 @@
+name: Build ArkOS M9 Pro Patched Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release Tag from lcdyk0517/arkos4clone'
+        required: false
+        default: '20260808'
+
+permissions:
+  contents: read
+
+jobs:
+  build-m9pro-image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Main Repository
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler kpartx p7zip-full mtools e2tools file jq
+
+      - name: Step 1 - Prepare M9 Pro DTB
+        run: |
+          echo "=== STEP 1: Building/Checking DTB ==="
+          if [ -f "rg32tw3ka.dts" ]; then
+            echo "Compiling rg32tw3ka.dts to m9pro.dtb..."
+            dtc -I dts -O dtb -o m9pro.dtb rg32tw3ka.dts
+          elif [ -f "rg32tw3ka.dtb" ]; then
+            echo "Using existing rg32tw3ka.dtb..."
+            cp rg32tw3ka.dtb m9pro.dtb
+          else
+            echo "::error::Neither rg32tw3ka.dts nor rg32tw3ka.dtb was found in your repository root!"
+            exit 1
+          fi
+
+      - name: Step 2 - Download All Image Parts via GitHub CLI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== STEP 2: Downloading Image Parts ==="
+          mkdir -p download_parts
+          TAG="${{ github.event.inputs.release_tag }}"
+
+          # Download all assets from tag 20260808
+          gh release download "$TAG" --repo lcdyk0517/arkos4clone --dir download_parts
+
+          echo "Downloaded assets:"
+          ls -lh download_parts/
+
+      - name: Step 3 - Extract Multi-Part Archive
+        run: |
+          echo "=== STEP 3: Extracting Multi-Part Image ==="
+          mkdir -p workdir
+
+          # Locate primary split part (.001, .7z.001, .part1.rar, etc.)
+          FIRST_PART=$(ls download_parts/*.001 download_parts/*.7z.001 download_parts/*.part1.rar 2>/dev/null | head -n 1 || true)
+
+          if [ -z "$FIRST_PART" ]; then
+            FIRST_PART=$(ls download_parts/*.7z download_parts/*.zip download_parts/* 2>/dev/null | head -n 1)
+          fi
+
+          echo "Extracting using primary archive header: $FIRST_PART"
+          7z x "$FIRST_PART" -oworkdir/ -y
+
+          IMG_FILE=$(find workdir/ -name "*.img" | head -n 1)
+          if [ -z "$IMG_FILE" ]; then
+            echo "::error::No .img file found after extraction!"
+            exit 1
+          fi
+
+          mv "$IMG_FILE" workdir/arkos_m9pro.img
+          echo "Uncompressed Image Size: $(du -h workdir/arkos_m9pro.img | cut -f1)"
+
+      - name: Step 4 - Inject Repository Hardware Fixes (Boot & RootFS)
+        run: |
+          echo "=== STEP 4: Mounting and Patching System Image ==="
+          cd workdir
+
+          sudo kpartx -av arkos_m9pro.img
+          sleep 3
+
+          LOOP_BOOT=$(ls /dev/mapper/loop*p1 | head -n 1)
+          LOOP_ROOT=$(ls /dev/mapper/loop*p2 | head -n 1)
+
+          if [ -z "$LOOP_BOOT" ] || [ -z "$LOOP_ROOT" ]; then
+            echo "::error::Could not resolve loop partitions!"
+            exit 1
+          fi
+
+          mkdir -p mnt_boot mnt_rootfs
+          sudo mount "$LOOP_BOOT" mnt_boot
+          sudo mount "$LOOP_ROOT" mnt_rootfs
+
+          echo "--- 4.1 Updating Boot Partition & DTBs ---"
+          sudo cp ../m9pro.dtb mnt_boot/rg32tw3ka.dtb
+          sudo cp ../m9pro.dtb mnt_boot/rk3326-r36s-linux.dtb 2>/dev/null || true
+          sudo cp ../m9pro.dtb mnt_boot/rk3326-rg351p-linux.dtb 2>/dev/null || true
+
+          if [ -f "mnt_boot/boot.ini" ]; then
+            sudo sed -i 's/dtb_name=.*/dtb_name=rg32tw3ka.dtb/' mnt_boot/boot.ini || true
+            sudo sed -i 's/rk3326-r36s-linux.dtb/rg32tw3ka.dtb/g' mnt_boot/boot.ini || true
+          fi
+
+          if [ -f "mnt_boot/extlinux/extlinux.conf" ]; then
+            sudo sed -i 's/rk3326-r36s-linux.dtb/rg32tw3ka.dtb/g' mnt_boot/extlinux/extlinux.conf || true
+            sudo sed -i 's/fdt .*/fdt \/rg32tw3ka.dtb/g' mnt_boot/extlinux/extlinux.conf || true
+          fi
+
+          echo "--- 4.2 Copying Repository Overlays & Custom Files ---"
+          # Copy firmware from repo if firmware/ folder exists
+          if [ -d "../firmware" ]; then
+            echo "Injecting custom firmware from repo..."
+            sudo cp -r ../firmware/* mnt_rootfs/lib/firmware/ 2>/dev/null || true
+          fi
+
+          # Copy kernel modules from repo if modules/ folder exists
+          if [ -d "../modules" ]; then
+            echo "Injecting kernel modules from repo..."
+            KERNEL_VER=$(ls mnt_rootfs/lib/modules/ | head -n 1)
+            if [ -n "$KERNEL_VER" ]; then
+              sudo cp -r ../modules/* "mnt_rootfs/lib/modules/$KERNEL_VER/" 2>/dev/null || true
+            fi
+          fi
+
+          # Copy generic rootfs files if overlay/ folder exists
+          if [ -d "../overlay" ]; then
+            echo "Applying custom rootfs file overlay..."
+            sudo cp -r ../overlay/* mnt_rootfs/ 2>/dev/null || true
+          fi
+
+          echo "--- 4.3 M9 Pro Hardware Fixes (WiFi, LEDs, Audio) ---"
+          # Force loading Wi-Fi drivers (RK915A & alternatives)
+          sudo mkdir -p mnt_rootfs/etc/modules-load.d/
+          echo -e "rk915\naic8800_fmac\n8188fu\n8723ds" | sudo tee mnt_rootfs/etc/modules-load.d/m9pro-wifi.conf > /dev/null
+
+          # Analog Stick LED Startup Hook
+          LED_SCRIPT="mnt_rootfs/etc/profile.d/m9pro-leds.sh"
+          sudo mkdir -p mnt_rootfs/etc/profile.d/
+          cat << 'EOF' | sudo tee "$LED_SCRIPT" > /dev/null
+          #!/bin/sh
+          # M9 Pro Analog Stick LED Auto-Enable
+          for led in /sys/class/leds/*; do
+            if [ -f "$led/brightness" ]; then
+              echo 255 > "$led/brightness" 2>/dev/null || echo 1 > "$led/brightness" 2>/dev/null
+            fi
+          done
+          EOF
+          sudo chmod +x "$LED_SCRIPT"
+
+          # Audio Output Setup
+          if [ -f "mnt_rootfs/etc/asound.conf" ]; then
+            sudo sed -i 's/card [0-9]/card 0/g' mnt_rootfs/etc/asound.conf || true
+          fi
+
+          sync
+          sudo umount mnt_boot
+          sudo umount mnt_rootfs
+
+          LOOP_DEV=$(echo "$LOOP_BOOT" | sed -E 's/p1$//; s|^/dev/mapper/||')
+          sudo kpartx -d "/dev/$LOOP_DEV" || sudo kpartx -d arkos_m9pro.img || true
+          echo "Patching process successfully completed."
+
+      - name: Step 5 - Compress Final Image
+        run: |
+          cd workdir
+          7z a -t7z -m0=lzma2 -mx=1 ArkOS_M9Pro_Flashable.7z arkos_m9pro.img
+
+      - name: Step 6 - Upload Flashable Image Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArkOS_M9Pro_Flashable_Image
+          path: workdir/ArkOS_M9Pro_Flashable.7z
+          retention-days: 7
