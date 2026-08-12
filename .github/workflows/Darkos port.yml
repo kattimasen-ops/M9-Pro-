@@ -1,4 +1,5 @@
-name: DarkOS4Clone M9 Pro Multi-Part Build
+
+name: Complete DarkOS4Clone M9 Pro Full Hardware Port
 
 on:
   workflow_dispatch:
@@ -12,7 +13,7 @@ permissions:
   contents: write
 
 jobs:
-  build-m9pro-image:
+  build-m9pro-full-image:
     runs-on: ubuntu-latest
 
     steps:
@@ -22,153 +23,149 @@ jobs:
       - name: Install System Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y device-tree-compiler kpartx p7zip-full mtools e2tools curl wget jq file
+          sudo apt-get install -y device-tree-compiler kpartx p7zip-full mtools e2tools file jq
 
       - name: Step 1 - Build M9 Pro DTB
         run: |
           echo "=== STEP 1: DTB Erstellung ==="
           if [ -f "rg32tw3ka.dts" ]; then
-            echo "Gefunden: rg32tw3ka.dts -> Kompiliere..."
+            echo "Kompiliere rg32tw3ka.dts zu DTB..."
             dtc -I dts -O dtb -o m9pro_patched.dtb rg32tw3ka.dts
           elif [ -f "rg32tw3ka.dtb" ]; then
-            echo "Gefunden: rg32tw3ka.dtb -> Kopiere..."
+            echo "Kopiere vorhandene rg32tw3ka.dtb..."
             cp rg32tw3ka.dtb m9pro_patched.dtb
           else
-            echo "::error::Weder rg32tw3ka.dts noch rg32tw3ka.dtb im Root-Verzeichnis gefunden!"
+            echo "::error::Keine rg32tw3ka.dts oder rg32tw3ka.dtb im Repository gefunden!"
             exit 1
           fi
 
-          if [ ! -s "m9pro_patched.dtb" ]; then
-            echo "::error::Die erstellte m9pro_patched.dtb ist leer!"
-            exit 1
-          fi
-          echo "DTB erfolgreich erstellt: $(du -h m9pro_patched.dtb | cut -f1)"
-
-      - name: Step 2 - Download All Parts from Release Tag
+      - name: Step 2 - Download All Release Assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "=== STEP 2: Download aller Release-Parts ==="
+          echo "=== STEP 2: Release Parts herunterladen ==="
           mkdir -p download_parts
-          cd download_parts
-
           TAG="${{ github.event.inputs.release_tag }}"
-          echo "Lade Assets für Tag '$TAG' aus lcdyk0517/arkos4clone..."
 
-          # Abfrage der Release-Assets via GitHub API für das angegebene Tag
-          RELEASE_JSON=$(curl -s -H "Accept: application/vnd.github+json" "https://api.github.com/repos/lcdyk0517/arkos4clone/releases/tags/$TAG")
+          gh release download "$TAG" --repo lcdyk0517/arkos4clone --dir download_parts || \
+          gh release download --repo lcdyk0517/arkos4clone --dir download_parts
 
-          # Falls Tag nicht gefunden wird, Fallback auf latest Release
-          if echo "$RELEASE_JSON" | grep -q "Not Found"; then
-            echo "Tag $TAG nicht gefunden, wähle latest Release..."
-            RELEASE_JSON=$(curl -s -H "Accept: application/vnd.github+json" https://api.github.com/repos/lcdyk0517/arkos4clone/releases/latest)
-          fi
+          ls -lh download_parts/
 
-          # Extrahiere alle Download-Links der vorhandenen Archive/Parts
-          URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[]?.browser_download_url')
-
-          if [ -z "$URLS" ] || [ "$URLS" == "null" ]; then
-            echo "::error::Keine Download-Assets im Release $TAG gefunden!"
-            exit 1
-          fi
-
-          echo "Gefundene Parts:"
-          echo "$URLS"
-
-          # Alle Part-Dateien herunterladen
-          for url in $URLS; do
-            echo "Lade Part herunter: $url"
-            wget --continue --progress=dot:giga "$url"
-          done
-
-          echo "Download abgeschlossen. Heruntergeladene Dateien:"
-          ls -lh
-
-      - name: Step 3 - Extract Multi-Part Archive
+      - name: Step 3 - Extract Multi-Part Image
         run: |
-          echo "=== STEP 3: Zusammenfügen & Entpacken der Parts ==="
+          echo "=== STEP 3: Image entpacken ==="
           mkdir -p workdir
 
-          # Suche nach der ersten Part-Datei (.001, .part1.rar, .zip.001 etc.)
-          FIRST_PART=$(ls download_parts/*.001 download_parts/*.part1.rar download_parts/*.part01.rar 2>/dev/null | head -n 1 || true)
-
-          # Fallback: Falls es sich um ein einzelnes Archiv handelt
+          FIRST_PART=$(ls download_parts/*.001 download_parts/*.part1.rar download_parts/*.7z download_parts/*.zip 2>/dev/null | head -n 1 || true)
           if [ -z "$FIRST_PART" ]; then
-            FIRST_PART=$(ls download_parts/*.7z download_parts/*.zip download_parts/*.rar 2>/dev/null | head -n 1 || true)
+            FIRST_PART=$(ls download_parts/* 2>/dev/null | head -n 1)
           fi
 
-          if [ -z "$FIRST_PART" ]; then
-            echo "::error::Keine entpackbare Archiv-Datei in download_parts gefunden!"
-            exit 1
-          fi
-
-          echo "Entpacke Multi-Part Archiv über Haupt-Part: $FIRST_PART"
+          echo "Entpacke Archiv: $FIRST_PART"
           7z x "$FIRST_PART" -oworkdir/ -y
 
-          # Suche nach der daraus hervorgehenden .img-Datei
           IMG_FILE=$(find workdir/ -name "*.img" | head -n 1)
-
           if [ -z "$IMG_FILE" ]; then
-            echo "::error::Keine .img Datei im entpackten Archiv gefunden!"
+            echo "::error::Keine .img Datei gefunden!"
             exit 1
           fi
 
-          echo "Gefundenes Image: $IMG_FILE"
           mv "$IMG_FILE" workdir/darkos_m9pro.img
-          echo "Gesamtgröße des entpackten Images: $(du -h workdir/darkos_m9pro.img | cut -f1)"
+          echo "Entpacktes Image: $(du -h workdir/darkos_m9pro.img | cut -f1)"
 
-      - name: Step 4 - Mount & Patch M9 Pro DTB
+      - name: Step 4 - Full System Patching (Boot & RootFS)
         run: |
-          echo "=== STEP 4: Injiziere M9 Pro DTB in Boot-Partition ==="
+          echo "=== STEP 4: M9 Pro Komplett-Anpassung ==="
           cd workdir
 
           sudo kpartx -av darkos_m9pro.img
-          sleep 2
+          sleep 3
 
           LOOP_BOOT=$(ls /dev/mapper/loop*p1 | head -n 1)
-          if [ -z "$LOOP_BOOT" ]; then
-            echo "::error::Konnte Loop-Partitionen nicht ermitteln!"
+          LOOP_ROOT=$(ls /dev/mapper/loop*p2 | head -n 1)
+
+          if [ -z "$LOOP_BOOT" ] || [ -z "$LOOP_ROOT" ]; then
+            echo "::error::Partitionen konnten nicht ermittelt werden!"
             exit 1
           fi
 
-          echo "Boot-Partition gemountet unter: $LOOP_BOOT"
-          mkdir -p mnt_boot
+          mkdir -p mnt_boot mnt_rootfs
           sudo mount "$LOOP_BOOT" mnt_boot
+          sudo mount "$LOOP_ROOT" mnt_rootfs
 
-          echo "Kopiere M9 Pro DTB..."
+          echo "--- 4.1 Boot-Partition & DTB Injektion ---"
           sudo cp ../m9pro_patched.dtb mnt_boot/rg32tw3ka.dtb
-          sudo cp ../m9pro_patched.dtb mnt_boot/rk3326-r36s-linux.dtb || true
-          sudo cp ../m9pro_patched.dtb mnt_boot/rk3326-rg351p-linux.dtb || true
+          sudo cp ../m9pro_patched.dtb mnt_boot/rk3326-r36s-linux.dtb 2>/dev/null || true
+          sudo cp ../m9pro_patched.dtb mnt_boot/rk3326-rg351p-linux.dtb 2>/dev/null || true
 
-          # boot.ini anpassen
           if [ -f "mnt_boot/boot.ini" ]; then
-            echo "Passe boot.ini an..."
             sudo sed -i 's/dtb_name=.*/dtb_name=rg32tw3ka.dtb/' mnt_boot/boot.ini || true
             sudo sed -i 's/rk3326-r36s-linux.dtb/rg32tw3ka.dtb/g' mnt_boot/boot.ini || true
           fi
 
-          # extlinux.conf anpassen
           if [ -f "mnt_boot/extlinux/extlinux.conf" ]; then
-            echo "Passe extlinux.conf an..."
             sudo sed -i 's/rk3326-r36s-linux.dtb/rg32tw3ka.dtb/g' mnt_boot/extlinux/extlinux.conf || true
             sudo sed -i 's/fdt .*/fdt \/rg32tw3ka.dtb/g' mnt_boot/extlinux/extlinux.conf || true
           fi
 
+          echo "--- 4.2 RK915A WiFi & Treiber-Injektion ---"
+          # Firmware aus Repo kopieren (falls vorhanden)
+          if [ -d "../firmware" ]; then
+            echo "Kopiere Custom Firmware aus Repository..."
+            sudo cp -r ../firmware/* mnt_rootfs/lib/firmware/ 2>/dev/null || true
+          fi
+
+          # Module aus Repo kopieren (falls vorhanden)
+          if [ -d "../modules" ]; then
+            echo "Kopiere Kernel-Module aus Repository..."
+            KERNEL_VER=$(ls mnt_rootfs/lib/modules/ | head -n 1)
+            if [ -n "$KERNEL_VER" ]; then
+              sudo cp -r ../modules/* "mnt_rootfs/lib/modules/$KERNEL_VER/" 2>/dev/null || true
+            fi
+          fi
+
+          # WLAN Auto-Load erzwingen
+          sudo mkdir -p mnt_rootfs/etc/modules-load.d/
+          echo -e "rk915\naic8800_fmac\n8188fu\n8723ds" | sudo tee mnt_rootfs/etc/modules-load.d/m9pro-wifi.conf > /dev/null
+
+          echo "--- 4.3 Analogstick LED-Steuerung einrichten ---"
+          # Auto-Start Skript zur Aktivierung der LEDs erstellen
+          LED_SCRIPT="mnt_rootfs/etc/profile.d/m9pro-leds.sh"
+          sudo mkdir -p mnt_rootfs/etc/profile.d/
+          cat << 'EOF' | sudo tee "$LED_SCRIPT" > /dev/null
+          #!/bin/sh
+          # M9 Pro Analog Stick LED Auto-Enable
+          for led in /sys/class/leds/*; do
+            if [ -f "$led/brightness" ]; then
+              echo 255 > "$led/brightness" 2>/dev/null || echo 1 > "$led/brightness" 2>/dev/null
+            fi
+          done
+          EOF
+          sudo chmod +x "$LED_SCRIPT"
+
+          echo "--- 4.4 Audio & Hardware-Infrastruktur ---"
+          # ALSA Sound-Card Default sicherstellen
+          if [ -f "mnt_rootfs/etc/asound.conf" ]; then
+            sudo sed -i 's/card [0-9]/card 0/g' mnt_rootfs/etc/asound.conf || true
+          fi
+
           sync
           sudo umount mnt_boot
-          
+          sudo umount mnt_rootfs
+
           LOOP_DEV=$(echo "$LOOP_BOOT" | sed -E 's/p1$//; s|^/dev/mapper/||')
           sudo kpartx -d "/dev/$LOOP_DEV" || sudo kpartx -d darkos_m9pro.img || true
-          echo "Boot-Partition erfolgreich gepatcht!"
+          echo "Systeminjektion erfolgreich abgeschlossen!"
 
-      - name: Step 5 - Compress & Package Output
+      - name: Step 5 - Compress Finished Image
         run: |
-          echo "=== STEP 5: Komprimiere fertiges M9 Pro Image ==="
           cd workdir
-          7z a -t7z -m0=lzma2 -mx=1 DarkOS_M9Pro_Patched.7z darkos_m9pro.img
-          echo "Fertiges Archiv: $(du -h DarkOS_M9Pro_Patched.7z | cut -f1)"
+          7z a -t7z -m0=lzma2 -mx=1 DarkOS_M9Pro_Full_Patched.7z darkos_m9pro.img
 
-      - name: Step 6 - Upload Artifact
+      - name: Step 6 - Upload Final Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DarkOS_M9Pro_Patched_Image
-          path: workdir/DarkOS_M9Pro_Patched.7z
+          name: DarkOS_M9Pro_Full_Hardware_Image
+          path: workdir/DarkOS_M9Pro_Full_Patched.7z
           retention-days: 7
