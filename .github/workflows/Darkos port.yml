@@ -1,0 +1,121 @@
+name: Port DarkOS4clones for M9 Pro
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_image_url:
+        description: 'URL zum DarkOS / ArkOS Clone Base-Image (.img.xz / .7z / .zip)'
+        required: false
+        default: 'https://github.com/ChristianHaitian/arkos/releases/download/v2.0.01242024/ArkOS_R36S_v2.0_01242024.img.xz'
+
+permissions:
+  contents: write
+
+jobs:
+  build-m9pro-image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Build Tools & Loop Utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler kpartx p7zip-full mtools e2tools curl wget python3
+
+      - name: Compile M9 Pro DTS to DTB
+        run: |
+          echo "=== 1. Hardware-Definition verarbeiten ==="
+          if [ -f "rg32tw3ka.dts" ]; then
+            echo "Kompiliere rg32tw3ka.dts zu m9pro.dtb..."
+            dtc -I dts -O dtb -o m9pro.dtb rg32tw3ka.dts
+          elif [ -f "rg32tw3ka.dtb" ]; then
+            echo "Verwende vorhandene rg32tw3ka.dtb..."
+            cp rg32tw3ka.dtb m9pro.dtb
+          else
+            echo "::error::Weder rg32tw3ka.dts noch rg32tw3ka.dtb im Repo gefunden!"
+            exit 1
+          fi
+
+      - name: Download and Extract Base DarkOS Image
+        run: |
+          mkdir -p build_dir
+          cd build_dir
+          
+          IMAGE_URL="${{ github.event.inputs.base_image_url }}"
+          echo "Lade DarkOS Base Image herunter von: $IMAGE_URL"
+          wget -q --show-progress -O archive_file "$IMAGE_URL"
+
+          echo "Entpacke Base Image..."
+          if [[ "$IMAGE_URL" == *.xz ]]; then
+            unxz archive_file -c > darkos_m9pro.img
+          elif [[ "$IMAGE_URL" == *.gz ]]; then
+            gunzip -c archive_file > darkos_m9pro.img
+          elif [[ "$IMAGE_URL" == *.7z ]] || [[ "$IMAGE_URL" == *.zip ]]; then
+            7z x archive_file -oext
+            mv ext/*.img darkos_m9pro.img
+          else
+            mv archive_file darkos_m9pro.img
+          fi
+
+          ls -lh darkos_m9pro.img
+
+      - name: Inject M9 Pro Specs (DTB, Boot-Configs & RK915A WiFi)
+        run: |
+          cd build_dir
+
+          # Image als Loop-Devices einrichten
+          sudo kpartx -av darkos_m9pro.img
+          
+          # Erkenne gemountete Partitionen (p1 = BOOT, p2 = RootFS)
+          LOOP_DEV=$(ls /dev/mapper/loop*p1 | head -n 1 | sed 's/p1//')
+          echo "Gemountetes Loop Device: $LOOP_DEV"
+
+          mkdir -p mnt_boot mnt_rootfs
+          sudo mount ${LOOP_DEV}p1 mnt_boot
+          sudo mount ${LOOP_DEV}p2 mnt_rootfs
+
+          echo "=== 1. Injiziere M9 Pro DTB (Display, LEDs, Buttons) ==="
+          sudo cp ../m9pro.dtb mnt_boot/rg32tw3ka.dtb
+          
+          # Überschreibe alle Standard-DTB-Fallbacks, falls das OS feste Namen sucht
+          sudo cp ../m9pro.dtb mnt_boot/rk3326-r36s-linux.dtb 2>/dev/null || true
+          sudo cp ../m9pro.dtb mnt_boot/rk3326-rg351p-linux.dtb 2>/dev/null || true
+
+          echo "=== 2. Anpassen der Bootloader-Konfigurationen ==="
+          # boot.ini anpassen
+          if [ -f "mnt_boot/boot.ini" ]; then
+            sudo sed -i 's/dtb_name=.*/dtb_name=rg32tw3ka.dtb/' mnt_boot/boot.ini 2>/dev/null || true
+            sudo sed -i 's/rk3326-r36s-linux.dtb/rg32tw3ka.dtb/g' mnt_boot/boot.ini 2>/dev/null || true
+          fi
+
+          # extlinux.conf anpassen
+          if [ -f "mnt_boot/extlinux/extlinux.conf" ]; then
+            sudo sed -i 's/rk3326-r36s-linux.dtb/rg32tw3ka.dtb/g' mnt_boot/extlinux/extlinux.conf 2>/dev/null || true
+            sudo sed -i 's/fdt .*/fdt \/rg32tw3ka.dtb/g' mnt_boot/extlinux/extlinux.conf 2>/dev/null || true
+          fi
+
+          echo "=== 3. RK915A WiFi & System-Vorbereitung ==="
+          # Falls extra Firmware-Dateien im Repo vorliegen (z.B. im Ordner firmware/), kopieren
+          if [ -d "../firmware" ]; then
+            echo "Kopiere Treiber-Firmware aus Repo in /lib/firmware..."
+            sudo cp -r ../firmware/* mnt_rootfs/lib/firmware/ 2>/dev/null || true
+          fi
+
+          # Aufräumen & Aushängen
+          sudo umount mnt_boot
+          sudo umount mnt_rootfs
+          sudo kpartx -d darkos_m9pro.img
+
+      - name: Compress Ported M9 Pro Image
+        run: |
+          cd build_dir
+          echo "Komprimiere fertiges M9 Pro Custom Image..."
+          7z a -t7z -m0=lzma2 -mx=9 DarkOS_M9Pro_Ported.7z darkos_m9pro.img
+
+      - name: Upload Image Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkOS_M9Pro_Ported_Image
+          path: build_dir/DarkOS_M9Pro_Ported.7z
