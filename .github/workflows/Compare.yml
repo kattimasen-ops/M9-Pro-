@@ -1,0 +1,196 @@
+name: M9 Pro DTB Analysis & arkos4clone Comparison
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  analyze-and-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Build Tools & DTC
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler python3 curl zip git
+
+      - name: Find and Prepare M9 Pro DTB / DTS
+        run: |
+          mkdir -p M9Pro_Analysis_Package
+          
+          # 1. Suche zuerst nach einer .dtb Datei im Repo
+          M9_FILE=$(find . -maxdepth 4 -name "*.dtb" | grep -v "arkos4clone_repo" | grep -v "clone_dtbs" | grep -v "M9Pro_Analysis_Package" | head -n 1)
+          
+          if [ -n "$M9_FILE" ]; then
+            echo "Gefundene M9 Pro DTB: $M9_FILE"
+            cp "$M9_FILE" M9Pro_Analysis_Package/m9pro_original.dtb
+            dtc -I dtb -O dts -o M9Pro_Analysis_Package/m9pro_decompiled.dts "$M9_FILE"
+          else
+            # 2. Falls keine .dtb existiert, suche nach einer .dts Datei
+            M9_FILE=$(find . -maxdepth 4 -name "*.dts" | grep -v "arkos4clone_repo" | grep -v "clone_dtbs" | grep -v "M9Pro_Analysis_Package" | head -n 1)
+            if [ -n "$M9_FILE" ]; then
+              echo "Gefundene M9 Pro DTS: $M9_FILE"
+              cp "$M9_FILE" M9Pro_Analysis_Package/m9pro_decompiled.dts
+              dtc -I dts -O dtb -o M9Pro_Analysis_Package/m9pro_original.dtb "$M9_FILE" 2>/dev/null || true
+            else
+              echo "::error::Keine .dtb oder .dts Datei im Repository gefunden! Bitte lade deine M9 Pro Datei hoch."
+              exit 1
+            fi
+          fi
+
+      - name: Clone and Process lcdyk0517/arkos4clone Repo
+        run: |
+          mkdir -p clone_dtbs
+          
+          echo "Cloning https://github.com/lcdyk0517/arkos4clone.git ..."
+          git clone --depth 1 https://github.com/lcdyk0517/arkos4clone.git arkos4clone_repo
+          
+          echo "Verarbeite alle DTB und DTS Dateien aus arkos4clone..."
+          
+          # A) .dtb Dateien dekompilieren
+          find arkos4clone_repo -name "*.dtb" | while read -r dtb_file; do
+            clean_name=$(echo "$dtb_file" | sed 's|arkos4clone_repo/||g' | tr '/' '_')
+            dts_name="${clean_name%.dtb}.dts"
+            
+            dtc -I dtb -O dts -o "clone_dtbs/${dts_name}" "$dtb_file" 2>/dev/null || true
+            cp "$dtb_file" "clone_dtbs/${clean_name}" 2>/dev/null || true
+          done
+
+          # B) Bereits vorhandene .dts Dateien direkt kopieren
+          find arkos4clone_repo -name "*.dts" | while read -r dts_file; do
+            clean_name=$(echo "$dts_file" | sed 's|arkos4clone_repo/||g' | tr '/' '_')
+            cp "$dts_file" "clone_dtbs/${clean_name}" 2>/dev/null || true
+          done
+
+      - name: Run Deep Hardware Signature Comparison
+        run: |
+          python3 -c "import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))" << 'EOF'
+          import re
+          import os
+          import shutil
+
+          def analyze_dts(filepath):
+              if not os.path.exists(filepath):
+                  return None
+              with open(filepath, 'r', errors='ignore') as f:
+                  content = f.read()
+
+              # 1. Panel / Display Treibersignatur
+              panels = re.findall(r'compatible\s*=\s*"([^"]*(?:panel|lcd|display|st77|ili|rm|nv|cwb)[^"]*)"', content, re.IGNORECASE)
+              
+              # 2. Keycodes (Tasten-Mappings & GPIOs)
+              keycodes = sorted(list(set(re.findall(r'linux,code\s*=\s*<([^>]+)>;', content))))
+              
+              # 3. ADC Channels für Analogsticks
+              adc = re.findall(r'io-channels\s*=\s*<([^>]+)>;', content)
+
+              # 4. WiFi / SDIO / Chipsets
+              wifi = re.findall(r'compatible\s*=\s*"([^"]*(?:wifi|sdio|rtl|realtek|brcm)[^"]*)"', content, re.IGNORECASE)
+
+              return {
+                  "panels": list(set(panels)) if panels else ["Standard / Generic LCD"],
+                  "keycodes": keycodes,
+                  "adc": list(set(adc)),
+                  "wifi": list(set(wifi))
+              }
+
+          m9_data = analyze_dts("M9Pro_Analysis_Package/m9pro_decompiled.dts")
+          
+          report_lines = []
+          report_lines.append("# M9 Pro Hardware Analyse vs. lcdyk0517/arkos4clone\n")
+          report_lines.append(f"**Gefundenes Display-Panel:** `{', '.join(m9_data['panels'])}`")
+          report_lines.append(f"**Erfasste Tasten (Keycodes):** `{len(m9_data['keycodes'])}`")
+          report_lines.append(f"**WLAN Module/Nodes:** `{', '.join(m9_data['wifi']) if m9_data['wifi'] else 'Keine expliziten DTB-Nodes (Autoprobe via USB/SDIO)'}`\n")
+          report_lines.append("## Match-Ranking aller arkos4clone DTBs\n")
+          report_lines.append("| DTB Pfad / Name | Match Score | Detail-Analyse | Empfehlung |")
+          report_lines.append("| :--- | :---: | :--- | :--- |")
+
+          results = []
+          clone_dir = "clone_dtbs"
+          best_match_dtb_filename = None
+          highest_score = -1
+
+          for filename in os.listdir(clone_dir):
+              if filename.endswith(".dts"):
+                  filepath = os.path.join(clone_dir, filename)
+                  clone_data = analyze_dts(filepath)
+                  
+                  score = 0
+                  details = []
+
+                  # Panel Check (50 Punkte)
+                  if any(p in clone_data['panels'] for p in m9_data['panels']):
+                      score += 50
+                      details.append("Display identisch")
+                  else:
+                      details.append("Abweichendes Display")
+
+                  # Tasten Check (35 Punkte)
+                  common_keys = set(m9_data['keycodes']).intersection(set(clone_data['keycodes']))
+                  if len(m9_data['keycodes']) > 0:
+                      ratio = len(common_keys) / len(m9_data['keycodes'])
+                      score += int(ratio * 35)
+                      details.append(f"{int(ratio*100)}% Tasten-Match")
+
+                  # ADC / Stick Check (15 Punkte)
+                  if m9_data['adc'] == clone_data['adc']:
+                      score += 15
+                      details.append("Analogsticks identisch")
+
+                  dtb_base_name = filename.replace('.dts', '.dtb')
+                  
+                  if score > highest_score:
+                      highest_score = score
+                      best_match_dtb_filename = dtb_base_name
+
+                  rec = "Direkt nutzbar" if score >= 85 else ("Nutzbar mit kleineren Fixes" if score >= 50 else "Ungeeignet")
+                  results.append((filename.replace('.dts', ''), score, ", ".join(details), rec, dtb_base_name))
+
+          results.sort(key=lambda x: x[1], reverse=True)
+
+          for name, score, detail, rec, _ in results[:35]: # Die besten 35 Treffer im Bericht auflisten
+              display_name = name.replace('_', '/')
+              report_lines.append(f"| `{display_name}` | **{score}%** | {detail} | {rec} |")
+
+          report_content = "\n".join(report_lines)
+
+          # 1. Bericht in Package schreiben
+          with open("M9Pro_Analysis_Package/ANALYSE_BERICHT.md", "w") as f:
+              f.write(report_content)
+
+          # 2. Bericht in GitHub Actions Step Summary schreiben
+          summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary_file:
+              with open(summary_file, 'a') as f:
+                  f.write(report_content)
+
+          # Kopiere die am besten passende Match-DTB ins Package
+          if best_match_dtb_filename and os.path.exists(os.path.join(clone_dir, best_match_dtb_filename)):
+              shutil.copy(os.path.join(clone_dir, best_match_dtb_filename), "M9Pro_Analysis_Package/best_matching_clone.dtb")
+
+          EOF
+
+      - name: Commit and Push Analysis Package to Repository
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add M9Pro_Analysis_Package/
+          
+          if git status --porcelain | grep -q "M9Pro_Analysis_Package"; then
+            git commit -m "auto: M9 Pro DTB Analyse & arkos4clone Vergleich [skip ci]"
+            git push origin main
+            echo "Analyse-Paket erfolgreich ins Repository hochgeladen!"
+          else
+            echo "Keine Änderungen am Analyse-Paket festgestellt."
+          fi
