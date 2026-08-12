@@ -1,0 +1,187 @@
+name: M9 Pro - Flexible Universal ArkOS Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-m9pro-image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler kpartx p7zip-full mtools e2tools file wget xz-utils jq
+
+      - name: Step 1 - Download ArkOS4Clone Image & Default Firstboot
+        run: |
+          echo "=== 1. Download der Original-Image-Dateien ==="
+          mkdir -p download_parts
+          cd download_parts
+
+          echo "Lade Part 1..."
+          wget --progress=dot:giga "https://github.com/lcdyk0517/arkos4clone/releases/download/20260808/ArkOS4Clone-08082026.img.xz.7z.001"
+          
+          echo "Lade Part 2..."
+          wget --progress=dot:giga "https://github.com/lcdyk0517/arkos4clone/releases/download/20260808/ArkOS4Clone-08082026.img.xz.7z.002"
+          
+          echo "Lade Part 3..."
+          wget --progress=dot:giga "https://github.com/lcdyk0517/arkos4clone/releases/download/20260808/ArkOS4Clone-08082026.img.xz.7z.003"
+
+          echo "Lade Fallback firstboot.sh..."
+          wget --progress=dot:giga "https://github.com/lcdyk0517/arkos4clone/releases/download/20260808/firstboot.sh"
+
+      - name: Step 2 - Entpacken des Archives (7z -> xz -> img)
+        run: |
+          echo "=== 2. Extrahiere Raw-Image ==="
+          mkdir -p workdir
+          
+          7z x download_parts/ArkOS4Clone-08082026.img.xz.7z.001 -oworkdir/ -y
+
+          cd workdir
+          XZ_FILE=$(ls *.xz 2>/dev/null | head -n 1)
+          
+          if [ -z "$XZ_FILE" ]; then
+            echo "::error::Keine .img.xz Datei gefunden!"
+            exit 1
+          fi
+
+          unxz -v "$XZ_FILE"
+
+          IMG_FILE=$(ls *.img 2>/dev/null | head -n 1)
+          if [ -z "$IMG_FILE" ]; then
+            echo "::error::Keine rohe .img-Datei erzeugt!"
+            exit 1
+          fi
+
+          mv "$IMG_FILE" darkos_m9pro.img
+          echo "Raw Image erfolgreich vorbereitet!"
+
+      - name: Step 3 - Flexible Repository-Suche & System-Injection
+        run: |
+          echo "=== 3. Durchsuche gesamtes Repo nach M9 Pro Dateien ==="
+
+          # 3.1 DTB / DTS Suche im gesamten Repo
+          DTB_SRC=$(find . -type f \( -name "rg32tw3ka.dts" -o -name "rg32tw3ka.dtb" \) ! -path "*/.git/*" ! -path "*/workdir/*" ! -path "*/download_parts/*" | head -n 1)
+
+          if [ -n "$DTB_SRC" ]; then
+            echo "DTB/DTS gefunden: $DTB_SRC"
+            if [[ "$DTB_SRC" == *.dts ]]; then
+              echo "Kompiliere DTS zu DTB..."
+              dtc -I dts -O dtb -o m9pro.dtb "$DTB_SRC"
+            else
+              cp "$DTB_SRC" m9pro.dtb
+            fi
+            DTB_READY=true
+          else
+            echo "::warning::Keine rg32tw3ka.dtb/dts im Repo gefunden!"
+            DTB_READY=false
+          fi
+
+          # 3.2 Partitionen Mounten
+          cd workdir
+          sudo kpartx -av darkos_m9pro.img
+          sleep 4
+
+          LOOP_BOOT=$(ls /dev/mapper/loop*p1 | head -n 1)
+          LOOP_ROOT=$(ls /dev/mapper/loop*p2 | head -n 1)
+
+          mkdir -p mnt_boot mnt_rootfs
+          sudo mount "$LOOP_BOOT" mnt_boot
+          sudo mount "$LOOP_ROOT" mnt_rootfs
+
+          # 3.3 DTB Injizieren
+          if [ "$DTB_READY" = "true" ]; then
+            echo "Injiziere DTB in Boot-Partition..."
+            sudo cp ../m9pro.dtb mnt_boot/rg32tw3ka.dtb
+            sudo cp ../m9pro.dtb mnt_boot/rk3326-r36s-linux.dtb 2>/dev/null || true
+            sudo cp ../m9pro.dtb mnt_boot/rk3326-rg351p-linux.dtb 2>/dev/null || true
+
+            if [ -f "mnt_boot/boot.ini" ]; then
+              sudo sed -i 's/dtb_name=.*/dtb_name=rg32tw3ka.dtb/' mnt_boot/boot.ini || true
+              sudo sed -i 's/rk3326-r36s-linux.dtb/rg32tw3ka.dtb/g' mnt_boot/boot.ini || true
+            fi
+            if [ -f "mnt_boot/extlinux/extlinux.conf" ]; then
+              sudo sed -i 's/rk3326-r36s-linux.dtb/rg32tw3ka.dtb/g' mnt_boot/extlinux/extlinux.conf || true
+              sudo sed -i 's/fdt .*/fdt \/rg32tw3ka.dtb/g' mnt_boot/extlinux/extlinux.conf || true
+            fi
+          fi
+
+          # 3.4 Custom firstboot.sh Suche
+          CUSTOM_FB=$(find .. -type f -name "firstboot.sh" ! -path "*/download_parts/*" ! -path "*/.git/*" ! -path "*/workdir/*" | head -n 1)
+          if [ -n "$CUSTOM_FB" ]; then
+            echo "Verwende eigene firstboot.sh aus Repo: $CUSTOM_FB"
+            sudo cp "$CUSTOM_FB" mnt_boot/firstboot.sh
+            [ -f "mnt_rootfs/usr/local/bin/firstboot.sh" ] && sudo cp "$CUSTOM_FB" mnt_rootfs/usr/local/bin/firstboot.sh
+          else
+            echo "Verwende Standard ArkOS firstboot.sh..."
+            sudo cp ../download_parts/firstboot.sh mnt_boot/firstboot.sh
+          fi
+          sudo chmod +x mnt_boot/firstboot.sh
+
+          # 3.5 Suche nach Treiber-Modulen (.ko) im ganzen Repo
+          KERNEL_VER=$(ls mnt_rootfs/lib/modules/ | head -n 1)
+          if [ -n "$KERNEL_VER" ]; then
+            TARGET_MOD_DIR="mnt_rootfs/lib/modules/$KERNEL_VER/extra/"
+            sudo mkdir -p "$TARGET_MOD_DIR"
+            echo "Suche nach .ko Treiber-Dateien..."
+            find .. -type f -name "*.ko" ! -path "*/.git/*" ! -path "*/workdir/*" ! -path "*/download_parts/*" -exec echo "Kopiere Treiber: {}" \; -exec sudo cp {} "$TARGET_MOD_DIR" \;
+          fi
+
+          # 3.6 Suche nach Firmware-Dateien (.bin, .fw) im ganzen Repo
+          echo "Suche nach Firmware-Dateien..."
+          find .. -type f \( -name "*.bin" -o -name "*.fw" \) ! -path "*/.git/*" ! -path "*/workdir/*" ! -path "*/download_parts/*" -exec echo "Kopiere Firmware: {}" \; -exec sudo cp {} mnt_rootfs/lib/firmware/ \;
+
+          # 3.7 Suche nach Audio-Konfiguration (asound.conf)
+          AUDIO_CONF=$(find .. -type f -name "asound.conf" ! -path "*/.git/*" ! -path "*/workdir/*" ! -path "*/download_parts/*" | head -n 1)
+          if [ -n "$AUDIO_CONF" ]; then
+            echo "Gefunden sound config: $AUDIO_CONF"
+            sudo cp "$AUDIO_CONF" mnt_rootfs/etc/asound.conf
+          fi
+
+          # 3.8 Module beim Start laden aktivieren
+          sudo mkdir -p mnt_rootfs/etc/modules-load.d/
+          echo -e "rk915\naic8800_fmac\naic8800_bsp\n8188fu\n8723ds" | sudo tee mnt_rootfs/etc/modules-load.d/m9pro-hardware.conf > /dev/null
+
+          # 3.9 Analog-Stick LEDs aktivieren
+          INIT_LED="mnt_rootfs/etc/init.d/S99m9pro-leds"
+          sudo mkdir -p mnt_rootfs/etc/init.d/
+          cat << 'EOF' | sudo tee "$INIT_LED" > /dev/null
+          #!/bin/sh
+          case "$1" in
+            start)
+              for led in /sys/class/leds/*; do
+                if [ -f "$led/brightness" ]; then
+                  echo 255 > "$led/brightness" 2>/dev/null || echo 1 > "$led/brightness" 2>/dev/null
+                fi
+              done
+              ;;
+          esac
+          EOF
+          sudo chmod +x "$INIT_LED"
+
+          sync
+          sudo umount mnt_boot
+          sudo umount mnt_rootfs
+
+          LOOP_DEV=$(echo "$LOOP_BOOT" | sed -E 's/p1$//; s|^/dev/mapper/||')
+          sudo kpartx -d "/dev/$LOOP_DEV" || sudo kpartx -d darkos_m9pro.img || true
+          echo "Injektion abgeschlossen!"
+
+      - name: Step 4 - Flashbares Archiv komprimieren
+        run: |
+          cd workdir
+          7z a -t7z -m0=lzma2 -mx=1 ArkOS_M9Pro_Flashable.7z darkos_m9pro.img
+
+      - name: Step 5 - Bereitstellen als GitHub Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArkOS_M9Pro_Flashable_Image
+          path: workdir/ArkOS_M9Pro_Flashable.7z
+          retention-days: 7
