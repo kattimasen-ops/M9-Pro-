@@ -1,6 +1,7 @@
-# M9 Pro Hardware Analyse vs. lcdyk0517/arkos4clone
+# Hardware Analyse der rg32tw3ka.dtb vs. lcdyk0517/arkos4clone
 
-**Gefundenes Display-Panel:** `arm,cortex-a35, arm,scmi-smc, rockchip,drm-logo, arm,sdei-1.0, arm,idle-state, arm,psci-1.0, rockchip,display-subsystem, arm,scmi-shmem, sitronix,st7703\0simple-panel-dsi, rockchip,px30-mali\0arm,mali-bifrost, arm,cortex-a35-pmu, arm,armv8-timer, arm,mali-simple-power-model, arm,gic-400, arm,pl330\0arm,primecell`
+**Analyse-Quelldatei:** `rg32tw3ka.dtb`
+**Gefundenes Display-Panel:** `arm,scmi-shmem, arm,scmi-smc, arm,mali-simple-power-model, arm,cortex-a35, arm,idle-state, arm,pl330\0arm,primecell, sitronix,st7703\0simple-panel-dsi, rockchip,drm-logo, arm,cortex-a35-pmu, rockchip,display-subsystem, arm,armv8-timer, arm,gic-400, arm,sdei-1.0, arm,psci-1.0, rockchip,px30-mali\0arm,mali-bifrost`
 **Erfasste Tasten (Keycodes):** `7`
 **WLAN Module/Nodes:** `Keine expliziten DTB-Nodes (Autoprobe via USB/SDIO)`
 
@@ -43,3 +44,8 @@
 | `consoles/rgb10max2/rk3326-rgb10max2-linux` | **60%** | Display identisch, 28% Tasten-Match | Nutzbar mit kleineren Fixes |
 | `consoles/origin panel3/rk3326-r36s-panel3-linux` | **60%** | Display identisch, 28% Tasten-Match | Nutzbar mit kleineren Fixes |
 | `consoles/r36max noamp/rk3326-r36max-without-amp-linux` | **60%** | Display identisch, 28% Tasten-Match | Nutzbar mit kleineren Fixes |
+| `consoles/rx6h/rk3326-rx6h-linux` | **60%** | Display identisch, 28% Tasten-Match | Nutzbar mit kleineren Fixes |
+| `consoles/r50h/rk3326-r50h-linux` | **60%** | Display identisch, 28% Tasten-Match | Nutzbar mit kleineren Fixes |
+| `consoles/r36ultrax/rk3326-r36ultrax-linux` | **60%** | Display identisch, 28% Tasten-Match | Nutzbar mit kleineren Fixes |
+| `consoles/r36tmax/rk3326-r36tmax-linux` | **60%** | Display identisch, 28% Tasten-Match | Nutzbar mit kleineren Fixes |
+| `consoles/origin panel2/rk3326-r36s-panel2-linux` | **60%** | Display identisch, 28% Tasten-Match | Nutzbar mit kleineren Fixes |
