@@ -1,0 +1,176 @@
+name: M9 Pro DTB Analysis & DarkOS Comparison
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  analyze-and-package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Build Tools & DTC
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler python3 curl zip git
+
+      - name: Find and Prepare M9 Pro DTB
+        run: |
+          mkdir -p M9Pro_Analysis_Package
+          
+          # Suche nach der hochgeladenen DTB Datei im Repo
+          M9_DTB=$(find . -maxdepth 4 -name "*.dtb" | grep -v "clone_dtbs" | grep -v "M9Pro_Analysis_Package" | head -n 1)
+          
+          if [ -z "$M9_DTB" ]; then
+            echo "::error::Keine DTB-Datei im Repository gefunden! Bitte lade deine M9 Pro DTB hoch."
+            exit 1
+          fi
+          
+          echo "Gefundene M9 Pro DTB: $M9_DTB"
+          cp "$M9_DTB" M9Pro_Analysis_Package/m9pro_original.dtb
+          dtc -I dtb -O dts -o M9Pro_Analysis_Package/m9pro_decompiled.dts "$M9_DTB"
+
+      - name: Fetch DarkOS / ArkOS Clone DTBs
+        run: |
+          mkdir -p clone_dtbs
+          cd clone_dtbs
+          
+          echo "Lade Clone-DTBs von ArkOS / DarkOS herunter..."
+          
+          BASE_URL="https://raw.githubusercontent.com/ChristianHaitian/arkos/main/r36s"
+          
+          curl -sL -O "$BASE_URL/rk3326-r36s-linux.dtb" || true
+          curl -sL -O "$BASE_URL/rk3326-r36s-panel2-linux.dtb" || true
+          curl -sL -O "$BASE_URL/rk3326-r36s-panel3-linux.dtb" || true
+          curl -sL -O "$BASE_URL/rk3326-r36s-panel4-linux.dtb" || true
+          curl -sL -O "$BASE_URL/rk3326-r36s-panel5-linux.dtb" || true
+          
+          # Dekomprimieren aller Clone DTBs
+          for dtb in *.dtb; do
+            if [ -f "$dtb" ]; then
+              name=$(basename "$dtb" .dtb)
+              dtc -I dtb -O dts -o "${name}.dts" "$dtb" 2>/dev/null || true
+            fi
+          done
+
+      - name: Run Python Deep Hardware Analysis & Comparison
+        run: |
+          python3 -c "import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))" << 'EOF'
+          import re
+          import os
+
+          def analyze_dts(filepath):
+              if not os.path.exists(filepath):
+                  return None
+              with open(filepath, 'r', errors='ignore') as f:
+                  content = f.read()
+
+              # 1. Panel / Display Treibersignatur
+              panels = re.findall(r'compatible\s*=\s*"([^"]*(?:panel|lcd|display|st77|ili|rm|nv)[^"]*)"', content, re.IGNORECASE)
+              
+              # 2. Keycodes (Tasten-Mappings)
+              keycodes = sorted(list(set(re.findall(r'linux,code\s*=\s*<([^>]+)>;', content))))
+              
+              # 3. ADC Channel für Analogsticks
+              adc = re.findall(r'io-channels\s*=\s*<([^>]+)>;', content)
+
+              # 4. WiFi / SDIO / Chipsets
+              wifi = re.findall(r'compatible\s*=\s*"([^"]*(?:wifi|sdio|rtl|realtek|brcm)[^"]*)"', content, re.IGNORECASE)
+
+              return {
+                  "panels": list(set(panels)) if panels else ["Standard / Generic LCD"],
+                  "keycodes": keycodes,
+                  "adc": list(set(adc)),
+                  "wifi": list(set(wifi))
+              }
+
+          m9_data = analyze_dts("M9Pro_Analysis_Package/m9pro_decompiled.dts")
+          
+          report_lines = []
+          report_lines.append("# M9 Pro Hardware Analyse & DarkOS DTB-Vergleich\n")
+          report_lines.append(f"**Gefundenes Display-Panel:** `{', '.join(m9_data['panels'])}`")
+          report_lines.append(f"**Anzahl erfasster Tasten (Keycodes):** `{len(m9_data['keycodes'])}`")
+          report_lines.append(f"**WLAN Module/Nodes:** `{', '.join(m9_data['wifi']) if m9_data['wifi'] else 'Keine expliziten DTB-Nodes (ggf. USB/SDIO Autoprobe)'}`\n")
+          report_lines.append("## Vergleich mit Bekannten Clone-DTBs\n")
+          report_lines.append("| Clone DTB Name | Match Score | Detail-Analyse | Empfehlung |")
+          report_lines.append("| :--- | :---: | :--- | :--- |")
+
+          results = []
+          clone_dir = "clone_dtbs"
+          best_match_dtb = None
+          highest_score = -1
+
+          for filename in os.listdir(clone_dir):
+              if filename.endswith(".dts"):
+                  filepath = os.path.join(clone_dir, filename)
+                  clone_data = analyze_dts(filepath)
+                  
+                  score = 0
+                  details = []
+
+                  # Panel Check (50 Punkte)
+                  if any(p in clone_data['panels'] for p in m9_data['panels']):
+                      score += 50
+                      details.append("Display identisch")
+                  else:
+                      details.append("Abweichendes Display")
+
+                  # Tasten Check (35 Punkte)
+                  common_keys = set(m9_data['keycodes']).intersection(set(clone_data['keycodes']))
+                  if len(m9_data['keycodes']) > 0:
+                      ratio = len(common_keys) / len(m9_data['keycodes'])
+                      score += int(ratio * 35)
+                      details.append(f"{int(ratio*100)}% Tasten-Match")
+
+                  # ADC / Stick Check (15 Punkte)
+                  if m9_data['adc'] == clone_data['adc']:
+                      score += 15
+                      details.append("Analogsticks identisch")
+
+                  dtb_base_name = filename.replace('.dts', '.dtb')
+                  
+                  if score > highest_score:
+                      highest_score = score
+                      best_match_dtb = dtb_base_name
+
+                  rec = "Direkt nutzbar" if score >= 85 else ("Nutzbar mit kleineren Fixes" if score >= 50 else "Ungeeignet")
+                  results.append((filename.replace('.dts', ''), score, ", ".join(details), rec))
+
+          results.sort(key=lambda x: x[1], reverse=True)
+
+          for name, score, detail, rec in results:
+              report_lines.append(f"| `{name}` | **{score}%** | {detail} | {rec} |")
+
+          report_content = "\n".join(report_lines)
+
+          # 1. Bericht in Package schreiben
+          with open("M9Pro_Analysis_Package/ANALYSE_BERICHT.md", "w") as f:
+              f.write(report_content)
+
+          # 2. Bericht in GitHub Actions Step Summary schreiben
+          summary_file = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary_file:
+              with open(summary_file, 'a') as f:
+                  f.write(report_content)
+
+          # Kopiere die am besten passende Match-DTB ins Package
+          if best_match_dtb and os.path.exists(os.path.join(clone_dir, best_match_dtb)):
+              os.system(f"cp clone_dtbs/{best_match_dtb} M9Pro_Analysis_Package/best_matching_clone.dtb")
+
+          EOF
+
+      - name: Package Clone DTS Files into Output Folder
+        run: |
+          mkdir -p M9Pro_Analysis_Package/all_decompiled_dts
+          cp clone_dtbs/*.dts M9Pro_Analysis_Package/all_decompiled_dts/ 2>/dev/null || true
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: M9Pro_DarkOS_Analysis_Package
+          path: M9Pro_Analysis_Package/
